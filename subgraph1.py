@@ -1,40 +1,40 @@
 import onnx
-import onnx_graphsurgeon as gs
+from onnx import utils
 
-# Load model
-onnx_model = onnx.load("yolov8n.onnx")
-graph = gs.import_onnx(onnx_model)
+# Load original ONNX model
+onnx_model = onnx.load("yolov8n-pose.onnx")
+input_names = [input.name for input in onnx_model.graph.input]
 
-# Replace these names with actual ones from Netron
-intermediate_output_names = [
-    "output1",
+# Define the intermediate outputs that will serve as the *inputs* to subgraph2
+intermediate_outputs = [
     "/model.22/Concat_output_0",
     "/model.22/dfl/conv/Conv_output_0",
-    "/model.22/Sigmoid_output_0"]
+    "/model.22/Sigmoid_output_0"
+]
 
-# Mark these tensors as outputs
-intermediate_outputs = [tensor for tensor in graph.tensors().values() if tensor.name in intermediate_output_names]
-graph.outputs = intermediate_outputs
+# The final outputs (these remain the same)
 
-# Export subgraph1
-onnx_subgraph1 = gs.export_onnx(graph)
-onnx.save(onnx_subgraph1, "subgraph1.onnx")
+final_outputs = [output.name for output in onnx_model.graph.output]
+print(final_outputs)
 
+utils.extract_model(
+    input_path="yolov8n-pose.onnx",
+    output_path="subgraph1.onnx",
+    input_names=input_names,
+    output_names=intermediate_outputs
+)
 
-
-
-
-# Load original full graph again
-graph = gs.import_onnx(onnx.load("yolov8n.onnx"))
-
-# Set intermediate nodes as new inputs
-intermediate_inputs = [tensor for tensor in graph.tensors().values() if tensor.name in intermediate_output_names]
-graph.inputs = intermediate_inputs
-
-# Set original output node(s) as output
-final_outputs = [tensor for tensor in graph.outputs]
-graph.outputs = final_outputs
-
-# Export subgraph2
-onnx_subgraph2 = gs.export_onnx(graph)
-onnx.save(onnx_subgraph2, "subgraph2.onnx")
+# Extract second subgraph: from intermediate to final outputs
+utils.extract_model(
+    input_path="yolov8n-pose.onnx",
+    output_path="subgraph2.onnx",
+    input_names=intermediate_outputs,
+    output_names=['output0']
+)
+# Extract second subgraph: from intermediate to final outputs
+utils.extract_model(
+    input_path="yolov8n-pose.onnx",
+    output_path="subgraph3.onnx",
+    input_names=input_names,
+    output_names=['output0']
+)
