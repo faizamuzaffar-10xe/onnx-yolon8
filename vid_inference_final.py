@@ -6,14 +6,14 @@ import numpy as np
 import numpy
 import onnxruntime as ort
 
-# --- Constants
+#  Constants
 video_path = "Trololo [iwGFalTRHDA].mp4"
 onnx_path = "subgraph1.onnx"
 input_size = (640, 640)
 conf_threshold = 0.6
 nms_threshold = 0.5
 
-# --- Session
+#  Session
 session = ort.InferenceSession(onnx_path)
 input_name = session.get_inputs()[0].name
 
@@ -335,7 +335,7 @@ while cap.isOpened():
     out.write(cv2.cvtColor(pose_img, cv2.COLOR_RGB2BGR))
 
 
-    # --- Show
+    #  Show
     cv2.imshow("Pose Estimation", cv2.cvtColor(pose_img, cv2.COLOR_RGB2BGR))
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
