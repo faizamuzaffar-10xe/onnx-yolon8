@@ -6,16 +6,35 @@ import numpy as np
 import numpy
 import onnxruntime as ort
 
-#  Constants
-video_path = "Trololo [iwGFalTRHDA].mp4"
-onnx_path = "subgraph1.onnx"
-input_size = (640, 640)
-conf_threshold = 0.6
-nms_threshold = 0.5
 
-#  Session
-session = ort.InferenceSession(onnx_path)
-input_name = session.get_inputs()[0].name
+
+
+
+
+def preprocess_image(frame, input_size=640):
+    img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    h, w = img.shape[:2]
+
+    if h > w:
+        scale = input_size / h
+        new_h = input_size
+        new_w = int(w * scale)
+    else:
+        scale = input_size / w
+        new_w = input_size
+        new_h = int(h * scale)
+
+    resized_img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    padded_img = np.zeros((input_size, input_size, 3), dtype=np.uint8)
+    pad_top = (input_size - new_h) // 2
+    pad_left = (input_size - new_w) // 2
+    padded_img[pad_top:pad_top + new_h, pad_left:pad_left + new_w] = resized_img
+
+    img_tensor = padded_img.transpose(2, 0, 1)
+    img_tensor = np.expand_dims(img_tensor, axis=0).astype(np.float32) / 255.0
+
+    return img_tensor, scale, pad_left, pad_top
+
 
 def get_constant(model_input_shape):
   strides = [8, 16, 32]
@@ -59,22 +78,7 @@ def get_mul_constant(model_input_shape):
       constant.append(stride)
 
   return numpy.array([constant])
-# def nms(dets, iou_thresh=0.5):
-#     if len(dets) == 0:
-#         return []
-#     boxes = np.array([d[:4] for d in dets])
-#     scores = np.array([d[4] for d in dets])
-#     indices = cv2.dnn.NMSBoxes(
-#         bboxes=boxes.tolist(),
-#         scores=scores.tolist(),
-#         score_threshold=0.4,
-#         nms_threshold=iou_thresh
-#     )
-#     if len(indices) == 0:
-#         return []
-#     if isinstance(indices, np.ndarray):
-#         indices = indices.flatten()
-#     return [dets[i] for i in indices]
+
 
 
 def nms(dets, iou_thresh=0.5):
@@ -126,7 +130,7 @@ def xywh_to_xyxy_np(boxes):
     y2 = cy + h / 2
     return np.stack([x1, y1, x2, y2], axis=1)
 
-def draw_detections(img, detections):
+def draw_detections(img, detections,class_scores):
     for det in detections:
         x1, y1, x2, y2, score, class_id = det[:6]
         if int(class_id) != 0:
@@ -134,7 +138,7 @@ def draw_detections(img, detections):
         x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
         label = f"Person: {score * 100:.1f}%"
         cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        cv2.putText(img, f"Person : {str(class_scores[0][0])[:6]}", (x1, y1 - 5),
+        cv2.putText(img, f"Person : {str(class_scores[0][0])[:8]}", (x1, y1 - 5),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
     return img
 
@@ -152,14 +156,8 @@ def iou(box1, box2):
     union_area = box1_area + box2_area - inter_area
     return inter_area / union_area if union_area else 0
 
-def draw_pose(img, dets, output, mask):
-    COCO_PAIRS = [
-        (5, 7), (7, 9), (6, 8), (8, 10),
-        (11, 13), (13, 15), (12, 14), (14, 16),
-        (5, 6), (11, 12), (5, 11), (6, 12),
-        (0, 1), (1, 3), (0, 2), (2, 4),
-        (0, 5), (0, 6)
-    ]
+def get_pose_indices(dets, filtered_boxes_scaled):
+    matched_indices = []
     for det in dets:
         best_iou = 0
         best_idx = None
@@ -168,178 +166,148 @@ def draw_pose(img, dets, output, mask):
             if iou_score > best_iou and iou_score > 0.5:
                 best_iou = iou_score
                 best_idx = i
-        if best_idx is None:
-            continue
+        matched_indices.append(best_idx)
+    return matched_indices
 
-        idx = best_idx
+def draw_pose(img, dets, output, mask, scale, pad_left, pad_top, matched_indices):
+    COCO_PAIRS = [
+        (5, 7), (7, 9), (6, 8), (8, 10),
+        (11, 13), (13, 15), (12, 14), (14, 16),
+        (5, 6), (11, 12), (5, 11), (6, 12),
+        (0, 1), (1, 3), (0, 2), (2, 4),
+        (0, 5), (0, 6)
+    ]
+    for det, idx in zip(dets, matched_indices):
+        if idx is None:
+            continue
         pose_raw = output[5:56, mask][:, idx]
         keypoints = pose_raw.reshape(17, 3)
 
         for i, (px, py, conf) in enumerate(keypoints):
             if conf < 0.3:
                 continue
-            px *= w0 / 640
-            py *= h0 / 640
+            px = (px - pad_left) / scale
+            py = (py - pad_top) / scale
             cv2.circle(img, (int(px), int(py)), 3, (0, 0, 255), -1)
+
         for start_idx, end_idx in COCO_PAIRS:
             x_start, y_start, conf_start = keypoints[start_idx]
             x_end, y_end, conf_end = keypoints[end_idx]
             if conf_start > 0.3 and conf_end > 0.3:
-                x_start = int(x_start * w0 / 640)
-                y_start = int(y_start * h0 / 640)
-                x_end = int(x_end * w0 / 640)
-                y_end = int(y_end * h0 / 640)
-                cv2.line(img, (x_start, y_start), (x_end, y_end), (255, 0, 0), 2)
+                x_start = (x_start - pad_left) / scale
+                y_start = (y_start - pad_top) / scale
+                x_end = (x_end - pad_left) / scale
+                y_end = (y_end - pad_top) / scale
+                cv2.line(img, (int(x_start), int(y_start)), (int(x_end), int(y_end)), (255, 0, 0), 2)
     return img
-#  Video setup
-cap = cv2.VideoCapture(video_path)
-# Get original video properties
-frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-fps = cap.get(cv2.CAP_PROP_FPS)
-
-output_path = "output_pose.mp4"
-
-fourcc = cv2.VideoWriter_fourcc(*"mp4v")  # Use 'XVID' or 'avc1' if mp4v doesn't work
-#fourcc = cv2.VideoWriter_fourcc(*"avc1") 
-out = cv2.VideoWriter(output_path, fourcc, fps, (frame_width, frame_height))
 
 
-while cap.isOpened():
-    ret, frame = cap.read()
-    if not ret:
-        break
+def main(video_path = "Trololo [iwGFalTRHDA].mp4",
+    onnx_path = "subgraph1.onnx",
+    input_size = (640, 640),
+    conf_threshold = 0.6,
+    nms_threshold = 0.5):
+    #  Video setup
+    session = ort.InferenceSession(onnx_path)
+    input_name = session.get_inputs()[0].name
 
-    h0, w0 = frame.shape[:2]
+    cap = cv2.VideoCapture(video_path)
+    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    output_path = "output_pose.mp4"
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    out = cv2.VideoWriter(output_path, fourcc, fps, (frame_width, frame_height))
 
-    #  Preprocess
-    img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    img_resized = cv2.resize(img, input_size)
-    img_input = img_resized.transpose(2, 0, 1)[np.newaxis, :, :, :].astype(np.float32) / 255.0
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
 
-    #  Inference
+        h0, w0 = frame.shape[:2]
+        #Preprocess output
+        img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-    intermediate_outputs = session.run(None, {input_name: img_input})
-
-    # Print output shapes and types
-    for i, output in enumerate(intermediate_outputs):
-        print(f"Intermediate Output {i} shape: {output.shape}, dtype: {output.dtype}")
-
-    #  Save outputs to pass to next subgraph
-    Concat_output_0 = intermediate_outputs[0]
-    Conv_output_0 = intermediate_outputs[1]
-    sigmoid_output = intermediate_outputs[2]
-
-
-
-
-    # Reshape inputs
-    x1 = Concat_output_0.reshape(1, 17, 3, 8400)     # shape: 1×17×3×8400
-    x2 = Conv_output_0.reshape(1, 4, 8400)           # shape: 1×4×8400
-
-    # Slice operations
-    # Placeholder slicing indices 
-    slice1_concat_l = x1[:, :, :2, :]                         # shape: 1×17×2×8400
-    slice2_concat_r = x1[:, :, 2:3, :]                         # shape: 1×17×3×8400 (no-op for completeness)
-    slice3_conv_l = x2[:, :2, :]                            # shape: 1×2×8400
-    slice4_conv_r = x2[:, 2:4, :]                            # shape: 1×2×8400
-
-    # Arithmetic Operations
-    x3_concat_l = slice1_concat_l * 2                                  # shape: 1×17×2×8400
-    # x4 = x3 + np.ones((1, 2, 8400)) * 2              # Broadcasting Add, shape: 1×17×2×8400
-    # x5 = x4 * np.ones((1, 2, 8400))                  # Broadcasting Mul, shape: 1×17×2×8400
-    x4_concat_l = x3_concat_l + get_constant_pose()
-
-    print("x3_concat_l shape",x3_concat_l.shape,get_constant_pose().shape)
-
-    x5_concat_l = x4_concat_l *  get_mul_constant((3,640,640))
-    print("x4_concat_l shape",x4_concat_l.shape,get_mul_constant((3,640,640)).shape)
-    # Slice for Sigmoid
-    x6_concat_r = slice2_concat_r                           # shape: 1×17×1×8400
-    x7_concat_r = 1 / (1 + np.exp(-x6_concat_r))                       # Sigmoid activation
-
-    # Concatenate: shape becomes 1×17×3×8400
-    x_concat1 = np.concatenate([x5_concat_l, x7_concat_r], axis=2)
-
-    # Reshape for final concat
-    x_concat1_reshaped = x_concat1.reshape(1, 51, 8400)
-
-    # sub 1 sub 2
-
-    add1 = slice4_conv_r + get_constant((3,640,640))
-    sub1 = get_constant((3,640,640)) - slice3_conv_l
-    print("slice4_conv_r shape",slice4_conv_r.shape,get_constant((3,640,640)).shape)
-    print("slice3_conv_l shape",slice3_conv_l.shape,get_constant((3,640,640)).shape)
-    # Right branch: arithmetic on x2 slices
-    x8_conv_sub = add1 - sub1                     # shape: 1×2×8400
-    x9_conv_add = sub1 + add1                             # shape: 1×2×8400
+        #img_input = preprocess_image(frame,(640, 640))
+        #img_input,new_w,new_h = preprocess_image(frame, 640)
+        img_input, scale, pad_left, pad_top = preprocess_image(frame)
 
 
-    x10_conv_r = x9_conv_add / 2     #add                                # shape: 1×2×8400
+        intermediate_outputs = session.run(None, {input_name: img_input})
+
+        Concat_output_0 = intermediate_outputs[0]
+        Conv_output_0 = intermediate_outputs[1]
+        sigmoid_output = intermediate_outputs[2]
+
+        x1 = Concat_output_0.reshape(1, 17, 3, 8400)
+        x2 = Conv_output_0.reshape(1, 4, 8400)
+
+        slice1_concat_l = x1[:, :, :2, :]
+        slice2_concat_r = x1[:, :, 2:3, :]
+        slice3_conv_l = x2[:, :2, :]
+        slice4_conv_r = x2[:, 2:4, :]
+
+        x3_concat_l = slice1_concat_l * 2
+        x4_concat_l = x3_concat_l + get_constant_pose()
+        x5_concat_l = x4_concat_l * get_mul_constant((3,640,640))
+        x6_concat_r = slice2_concat_r
+        x7_concat_r = 1 / (1 + np.exp(-x6_concat_r))
+        x_concat1 = np.concatenate([x5_concat_l, x7_concat_r], axis=2)
+        x_concat1_reshaped = x_concat1.reshape(1, 51, 8400)
+
+        add1 = slice4_conv_r + get_constant((3,640,640))
+        sub1 = get_constant((3,640,640)) - slice3_conv_l
+        x8_conv_sub = add1 - sub1
+        x9_conv_add = sub1 + add1
+        x10_conv_r = x9_conv_add / 2
+        x_concat2_conv = np.concatenate([x10_conv_r,x8_conv_sub], axis=1)
+        x11_conv = x_concat2_conv * get_mul_constant((3,640,640))
+        final_concat = np.concatenate([x11_conv,sigmoid_output,x_concat1_reshaped], axis=1)
+
+        output = final_concat[0]
+
+        boxes = output[0:4].T
+        objectness = 1 / (1 + np.exp(-output[4]))
+        class_scores = 1 / (1 + np.exp(-output[5:]))
+        class_scores = class_scores.T
+
+        confidences = objectness[:, None] * class_scores
+        class_ids = np.argmax(confidences, axis=1)
+        scores = np.max(confidences, axis=1)
+        mask = scores > conf_threshold
+
+        filtered_boxes = boxes[mask]
+        filtered_scores = scores[mask]
+        filtered_class_ids = class_ids[mask]
+        # Adjust for scale and padding (xywh format)
+        filtered_boxes_scaled = filtered_boxes.copy()
+        filtered_boxes_scaled[:, 0] = (filtered_boxes_scaled[:, 0] - pad_left) / scale  # cx
+        filtered_boxes_scaled[:, 1] = (filtered_boxes_scaled[:, 1] - pad_top) / scale   # cy
+        filtered_boxes_scaled[:, 2] = filtered_boxes_scaled[:, 2] / scale               # w
+        filtered_boxes_scaled[:, 3] = filtered_boxes_scaled[:, 3] / scale               # h
+
+        #filtered_boxes_scaled = filtered_boxes * np.array([w0 / 640, h0 / 640, w0 / 640, h0 / 640])
+        filtered_boxes_scaled_xyxy = xywh_to_xyxy_np(filtered_boxes_scaled)
+
+        dets = [
+            [*filtered_boxes_scaled_xyxy[i], filtered_scores[i], filtered_class_ids[i]]
+            for i in range(len(filtered_scores))
+        ]
+
+        final_detections = nms(dets)
+        annotated = draw_detections(img.copy(), final_detections,class_scores)
+        matched_indices = get_pose_indices(final_detections, filtered_boxes_scaled)
+        pose_img = draw_pose(annotated, final_detections, output, mask, scale, pad_left, pad_top, matched_indices)
+
+        out.write(cv2.cvtColor(pose_img, cv2.COLOR_RGB2BGR))
+        cv2.imshow("Pose Estimation", cv2.cvtColor(pose_img, cv2.COLOR_RGB2BGR))
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    cap.release()
+    out.release()
+    cv2.destroyAllWindows()
 
 
-
-    # Concat -> shape: 1×4×8400
-    x_concat2_conv = np.concatenate([x10_conv_r,x8_conv_sub], axis=1)
-    #x11 = x_concat2 * np.ones((1, 4, 8400))          # Broadcasting Mul
-    x11_conv = x_concat2_conv * get_mul_constant((3,640,640)) 
-    print("x_concat2_conv shape",x_concat2_conv.shape,get_mul_constant((3,640,640)).shape)  
-    # Final concat -> shape: 1×56×8400
-    final_concat = np.concatenate([x11_conv,sigmoid_output,x_concat1_reshaped], axis=1)
-
-    # Final output
-    output = final_concat  # shape: 1×56×8400
-
-    print("out shape",output.shape)
-
-
-
-    output = output[0]
-
-    boxes = output[0:4].T
-    objectness = 1 / (1 + np.exp(-output[4]))
-    class_scores = 1 / (1 + np.exp(-output[5:]))
-    class_scores = class_scores.T
-
-    confidences = objectness[:, None] * class_scores
-    class_ids = np.argmax(confidences, axis=1)
-    scores = np.max(confidences, axis=1)
-    mask = scores > conf_threshold
-
-    filtered_boxes = boxes[mask]
-    filtered_scores = scores[mask]
-    filtered_class_ids = class_ids[mask]
-
-
-    # Scale and convert boxes
-    filtered_boxes_scaled = filtered_boxes * np.array([w0 / 640, h0 / 640, w0 / 640, h0 / 640])
-    filtered_boxes_scaled_xyxy = xywh_to_xyxy_np(filtered_boxes_scaled)
-
-    dets = [
-        [*filtered_boxes_scaled_xyxy[i], filtered_scores[i], filtered_class_ids[i]]
-        for i in range(len(filtered_scores))
-    ]
-
-    # NMS
-
-    final_detections = nms(dets)
-
-
-
-
-    # Draw
-    annotated = draw_detections(img.copy(), final_detections)
-    pose_img = draw_pose(annotated, final_detections, output, mask)
-
-    #out.write(pose_img)
-    out.write(cv2.cvtColor(pose_img, cv2.COLOR_RGB2BGR))
-
-
-    #  Show
-    cv2.imshow("Pose Estimation", cv2.cvtColor(pose_img, cv2.COLOR_RGB2BGR))
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
-
-cap.release()
-out.release()
-cv2.destroyAllWindows()
+if __name__ == "__main__":
+    main()
